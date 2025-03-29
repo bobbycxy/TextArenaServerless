@@ -2,10 +2,12 @@ import sys, json, time, random
 import uvicorn, asyncio
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 from typing import List, Dict
 import textarena as ta
 import os
+import threading
 
 import logging
 import traceback
@@ -36,6 +38,9 @@ supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
+# Global flag to track server shutdown request
+server_shutdown_requested = False
+
 # FastAPI app with CORS settings
 def get_allowed_origins():
     return [
@@ -47,6 +52,20 @@ def get_allowed_origins():
         "https://textarena.ai",
         "https://api.textarena.ai"
     ]
+
+def force_exit_after_delay(delay=15):
+    """Force exit the process after a delay, as a fallback."""
+    def _exit_func():
+        time.sleep(delay)
+        logging.warning(f"Forcing exit after {delay} seconds")
+        os._exit(0)  # Hard exit that can't be caught or blocked
+    
+    # Start a daemon thread that will force exit
+    exit_thread = threading.Thread(target=_exit_func)
+    exit_thread.daemon = True
+    exit_thread.start()
+    logging.info(f"Scheduled forced exit in {delay} seconds")
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -67,11 +86,25 @@ async def cors_middleware(request: Request, call_next):
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
+# Add this middleware to check for shutdown requests
+@app.middleware("http")
+async def check_shutdown(request: Request, call_next):
+    if server_shutdown_requested:
+        # Return a 503 Service Unavailable during shutdown
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is shutting down."}
+        )
+    return await call_next(request)
+
 
 class Game:
     def __init__(self, environment_id: int, env_id: str, tokens: List[str], supabase: Client):
         self.initialization_ts = time.time()
         self.game_active = False 
+
+        # Add shutdown tracking
+        self.shutdown_initiated = False
 
         # Add message tracking
         self.game_over_messages_sent = {pid: False for pid in range(len(tokens))}
@@ -205,10 +238,13 @@ class Game:
             # Wait to ensure all messages are sent
             await asyncio.sleep(delay)
             
+            # Track which websockets we've already closed
+            closed_websockets = set()
+            
             # Send a final notification
             for pid in self.player_dict:
                 websocket = self.player_dict[pid]["websocket"]
-                if websocket:
+                if websocket and websocket not in closed_websockets and not getattr(websocket, 'closed', True):
                     try:
                         message = {
                             "command": "server_shutdown",
@@ -217,21 +253,53 @@ class Game:
                         await websocket.send_text(json.dumps(message))
                         logging.info(f"Shutdown message sent to Player {pid}")
                         
-                        # Close the websocket gracefully
+                        # Close the websocket gracefully and mark it as closed
                         await websocket.close(code=1000)
+                        closed_websockets.add(websocket)
                         logging.info(f"Closed websocket for Player {pid}")
                     except Exception as e:
-                        logging.error(f"Error sending shutdown message to Player {pid}: {e}")
+                        logging.error(f"Error during shutdown for Player {pid}: {e}")
             
             # Final wait before shutdown
             await asyncio.sleep(2)
             
-            # Now actually shut down
-            await self.shutdown_task()
+            # Mark as ready for final shutdown
+            self.shutdown_initiated = True
+            
+            # Schedule the actual shutdown task
+            asyncio.create_task(self._final_shutdown())
         except Exception as e:
             logging.error(f"Error in delayed shutdown: {e}")
-            # Ensure shutdown still happens even on error
-            await self.shutdown_task()
+            # Still try to shut down even if there was an error
+            asyncio.create_task(self._final_shutdown())
+
+    async def _final_shutdown(self):
+        """Final shutdown process that exits the Fargate task."""
+        try:
+            # Last wait to ensure all messages are processed
+            await asyncio.sleep(3)
+            
+            logging.info("Executing final Fargate task shutdown")
+            
+            # Set up a fallback forced exit in case the normal exit gets stuck
+            force_exit_after_delay(15)  # Force exit after 15 seconds if normal exit fails
+            
+            # Try normal exit first
+            try:
+                logging.info("Shutting down Fargate task.")
+                sys.exit(0)  # This might raise an exception that gets caught
+            except SystemExit:
+                # This is expected, but the exception might be caught by uvicorn
+                # The force_exit fallback will handle this case
+                pass
+            except Exception as e:
+                logging.error(f"Error during sys.exit: {e}")
+                # Fall back to os._exit
+                os._exit(0)
+        except Exception as e:
+            logging.error(f"Error during final shutdown: {e}")
+            # Force exit even if there's an error
+            os._exit(1)
 
     async def _get_and_send_observation(self):
         logging.info("Getting next observation")
@@ -288,40 +356,40 @@ class Game:
                         await websocket.send_text(json.dumps(message))
 
     async def shutdown_task(self):
-        """Gracefully shutdown the Fargate task after all cleanup is done."""
+        """Handle cleanup before shutdown, but defer to _final_shutdown for the actual exit."""
         try:
-            # First notify all clients about shutdown
+            # Only proceed if we haven't already initiated shutdown
+            if hasattr(self, 'shutdown_initiated') and self.shutdown_initiated:
+                logging.info("Shutdown already initiated, skipping redundant shutdown")
+                return
+                
+            # Check if any websockets are still open
+            open_count = 0
             for pid in self.player_dict:
                 websocket = self.player_dict[pid]["websocket"]
-                if websocket and not websocket.client_state == WebSocketDisconnect:
+                if websocket and not getattr(websocket, 'closed', True):
+                    open_count += 1
                     try:
                         message = {
                             "command": "server_shutdown",
                             "message": "Game server is shutting down"
                         }
                         await websocket.send_text(json.dumps(message))
-                    except Exception as e:
-                        print(f"Error sending shutdown message to player {pid}: {e}")
-            
-            # Wait to ensure messages are sent
-            await asyncio.sleep(3)
-            
-            # Close websockets gracefully
-            for pid in self.player_dict:
-                websocket = self.player_dict[pid]["websocket"]
-                if websocket and not websocket.client_state == WebSocketDisconnect:
-                    try:
                         await websocket.close(code=1000)
+                        logging.info(f"Closed websocket for Player {pid} during shutdown_task")
                     except Exception as e:
-                        print(f"Error closing websocket for player {pid}: {e}")
+                        # Just log the error and continue
+                        logging.warning(f"Error closing websocket for player {pid}: {e}")
             
-            # Final wait before exit
-            await asyncio.sleep(2)
+            logging.info(f"Shutdown task completed, closed {open_count} open websockets")
+            
+            # Mark as initiated and schedule the final shutdown
+            self.shutdown_initiated = True
+            asyncio.create_task(self._final_shutdown())
         except Exception as e:
-            print(f"Error during shutdown: {e}")
-        finally:
-            print("Shutting down Fargate task.")
-            sys.exit(0)
+            logging.error(f"Error during shutdown task: {e}")
+            # Still try to exit
+            asyncio.create_task(self._final_shutdown())
 
 
     async def _send_timeout_messages(self, timeout_pid: int):
@@ -569,4 +637,16 @@ async def command_action(payload: Dict, token: str, websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import signal
+    
+    def signal_handler(sig, frame):
+        global server_shutdown_requested
+        logging.info(f"Received signal {sig}, initiating shutdown")
+        server_shutdown_requested = True
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start server with graceful shutdown
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
