@@ -27,7 +27,21 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
                 raise ValueError(f"No model found for token: {token}")
             model_id = model_response.data[0]["id"]
         
-        ts_response = supabase.table("trueskill").select("trueskill", "sd").eq("model_id", model_id).eq("environment_id", environment_id).execute()
+        ts_response = supabase.table("trueskill").select("trueskill", "sd", "updated_at").eq("model_id", model_id).eq("environment_id", environment_id).order("updated_at", desc=True).execute()
+        
+        # Enhanced logging for trueskill data
+        logging.info(f"TrueSkill response for player_id={player_id}, model_id={model_id}, environment_id={environment_id}:")
+        logging.info(f"Full ts_response data: {json.dumps(ts_response.data, indent=2) if ts_response.data else 'No data'}")
+        
+        if ts_response.data:
+            logging.info(f"Retrieved trueskill value: {ts_response.data[0]['trueskill']}, SD: {ts_response.data[0]['sd']}, Updated at: {ts_response.data[0]['updated_at']}")
+            if len(ts_response.data) > 1:
+                logging.info(f"Multiple records found - using most recent. Total records: {len(ts_response.data)}")
+                for i, record in enumerate(ts_response.data):
+                    logging.info(f"  Record {i+1}: Trueskill={record['trueskill']}, SD={record['sd']}, Updated at={record['updated_at']}")
+        else:
+            logging.info("No existing trueskill record found, will use default values (25.0, 8.333)")
+        
         current_ts = ts_response.data[0]["trueskill"] if ts_response.data else 25.0
         current_sd = ts_response.data[0]["sd"] if ts_response.data else 8.333
         
@@ -69,19 +83,41 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
     else:
         raise ValueError(f"Unsupported game type: {game_type}")
     
+    # Log all trueskill changes
+    logging.info("TrueSkill updates summary:")
+    
     for player_id, new_rating in new_ratings.items():
         token = player_ratings[player_id]["token"]
         model_id = player_ratings[player_id]["model_id"]
+        old_ts = result[token]["old_trueskill"]
+        old_sd = result[token]["old_sd"]
+        
+        # Calculate the changes
+        ts_change = new_rating.mu - old_ts
+        sd_change = new_rating.sigma - old_sd
+        
         result[token].update({
             "new_trueskill": new_rating.mu,
-            "new_sd": new_rating.sigma
+            "new_sd": new_rating.sigma,
+            "trueskill_change": ts_change,
+            "sd_change": sd_change
         })
-        supabase.table("trueskill").upsert({
+        
+        # Log before updating Supabase with clear change indicators
+        logging.info(f"Player {player_id} (token={token}, model_id={model_id}):")
+        logging.info(f"  - Trueskill: {old_ts:.2f} → {new_rating.mu:.2f} (Δ: {ts_change:+.2f})")
+        logging.info(f"  - SD: {old_sd:.2f} → {new_rating.sigma:.2f} (Δ: {sd_change:+.2f})")
+        
+        # Perform the update
+        upsert_response = supabase.table("trueskill").upsert({
             "model_id": model_id,
             "environment_id": environment_id,
             "trueskill": new_rating.mu,
             "sd": new_rating.sigma
         }).execute()
+        
+        # Log the response from the upsert operation
+        logging.info(f"Supabase upsert response for player {player_id}: {upsert_response.data if hasattr(upsert_response, 'data') else 'No data'}")
     
     return result
 
@@ -104,6 +140,9 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
     Updates Supabase tables (games, player_games, moves) and sends closing messages to players.
     Handles disconnections for non-human players by counting them as a loss.
     """
+    logging.info("=== GAME STATE UPDATE ===")
+    logging.info(f"Rewards: {rewards}")
+    logging.info(f"Reason: {reason}")
     for pid in game_obj.player_dict:
         if not game_obj.connected[pid]:
             token = game_obj.player_dict[pid]["token"]
@@ -122,6 +161,8 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
     game_response = supabase.table("games").insert(game_data).execute()
     game_id = game_response.data[0]["id"]
 
+    logging.info(f"Game finished (id={game_id}). Calculating trueskill updates for all players.")
+    
     trueskill_update_dict = update_trueskill_scores(
         environment_id=game_obj.environment_id,
         rewards=rewards,
@@ -129,6 +170,8 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
         supabase=supabase
     )
 
+    logging.info(f"Trueskill updates completed. Recording player_games and moves to database.")
+    
     player_game_ids = {}
     for pid in game_obj.player_dict:
         token = game_obj.player_dict[pid]["token"]
@@ -175,14 +218,26 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
             try:
                 token = game_obj.player_dict[pid]["token"]
                 opponents = [{"player_id": other_pid, "outcome": outcomes[other_pid]} for other_pid in game_obj.player_dict if other_pid != pid]
+                
+                # Get trueskill change and new value
+                ts_change = trueskill_update_dict[token]["new_trueskill"] - trueskill_update_dict[token]["old_trueskill"]
+                new_ts = trueskill_update_dict[token]["new_trueskill"]
+                
                 message = {
                     "command": "game_over",
                     "outcome": outcomes[pid],
                     "reward": rewards[pid],
-                    "trueskill_change": trueskill_update_dict[token]["new_trueskill"] - trueskill_update_dict[token]["old_trueskill"],
+                    "trueskill_change": ts_change,
+                    "new_trueskill": new_ts,
                     "opponents": opponents,
                     "reason": reason
                 }
+                
+                # Log the game over message with trueskill details
+                logging.info(f"Game over for Player {pid}:")
+                logging.info(f"  - Outcome: {outcomes[pid]}")
+                logging.info(f"  - Reward: {rewards[pid]}")
+                logging.info(f"  - New TrueSkill: {new_ts:.2f} (Δ: {ts_change:+.2f})")
                 await websocket.send_text(json.dumps(message))
                 game_obj.game_over_messages_sent[pid] = True
                 logging.info(f"Game over message sent to Player {pid} from update_game_state")
