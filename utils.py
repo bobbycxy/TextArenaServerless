@@ -27,7 +27,7 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
                 raise ValueError(f"No model found for token: {token}")
             model_id = model_response.data[0]["id"]
         
-        ts_response = supabase.table("trueskill").select("trueskill", "sd", "updated_at").eq("model_id", model_id).eq("environment_id", environment_id).order("updated_at", desc=True).execute()
+        ts_response = supabase.table("trueskill").select("trueskill", "sd", "updated_at").eq("model_id", model_id).eq("environment_id", environment_id).order("updated_at", desc=True).limit(1).execute()
         
         # Enhanced logging for trueskill data
         logging.info(f"TrueSkill response for player_id={player_id}, model_id={model_id}, environment_id={environment_id}:")
@@ -62,7 +62,7 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
     game_type = env_response.data[0]["game_type"]
     
     new_ratings = {}
-    if game_type == "two_player":
+    if game_type == "zs_two_player":
         p1_id, p2_id = list(player_ratings.keys())
         p1_rating = player_ratings[p1_id]["rating"]
         p2_rating = player_ratings[p2_id]["rating"]
@@ -74,12 +74,82 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
             new_p1_rating, new_p2_rating = trueskill.rate_1vs1(p1_rating, p2_rating, drawn=True)
         new_ratings[p1_id] = new_p1_rating
         new_ratings[p2_id] = new_p2_rating
-    elif game_type == "multi_player":
-        ranked_players = sorted(player_ratings.keys(), key=lambda x: rewards[x], reverse=True)
-        rating_groups = [[player_ratings[pid]["rating"]] for pid in ranked_players]
-        new_rating_groups = trueskill.rate(rating_groups)
-        for i, pid in enumerate(ranked_players):
-            new_ratings[pid] = new_rating_groups[i][0]
+    elif game_type == "multi_player_ffa":
+        # For free-for-all, group players by their rewards to handle ties properly
+        # Group players by reward value
+        reward_groups = {}
+        for pid, reward in rewards.items():
+            if reward not in reward_groups:
+                reward_groups[reward] = []
+            reward_groups[reward].append(pid)
+        
+        # Create rating groups and ranks
+        rating_groups = []
+        ranks = []
+        current_rank = 0
+        
+        # Sort rewards in descending order
+        sorted_rewards = sorted(reward_groups.keys(), reverse=True)
+        
+        for reward in sorted_rewards:
+            # Players with the same reward get the same rank (handling ties)
+            player_ids = reward_groups[reward]
+            
+            # Create individual rating groups for each player
+            for pid in player_ids:
+                rating_groups.append([player_ratings[pid]["rating"]])
+                ranks.append(current_rank)
+            
+            # Next distinct reward gets a different rank
+            current_rank += 1
+        
+        # Use TrueSkill's rate with ranks to handle ties correctly
+        new_rating_groups = trueskill.rate(rating_groups, ranks=ranks)
+        
+        # Map the new ratings back to players
+        group_index = 0
+        for reward in sorted_rewards:
+            player_ids = reward_groups[reward]
+            for pid in player_ids:
+                new_ratings[pid] = new_rating_groups[group_index][0]
+                group_index += 1
+    elif game_type == "multi_player_team":
+        # For team-based games, we need to group players by their rewards
+        # Players with the same reward are on the same team
+        teams = {}
+        for pid, reward in rewards.items():
+            if reward not in teams:
+                teams[reward] = []
+            teams[reward].append(pid)
+        
+        # Sort teams by reward (highest first)
+        sorted_rewards = sorted(teams.keys(), reverse=True)
+        
+        # Create rating groups for trueskill
+        rating_groups = []
+        ranks = []
+        for reward in sorted_rewards:
+            team_ratings = [player_ratings[pid]["rating"] for pid in teams[reward]]
+            rating_groups.append(team_ratings)
+            
+            # For ranks, use negative of reward so higher rewards get lower ranks
+            # TrueSkill expects lower ranks to be better
+            ranks.append(-reward)
+        
+        # If all teams have the same reward (all draw), ensure ranks are all the same
+        if len(set(ranks)) == 1:
+            ranks = [0] * len(ranks)
+        
+        # Use TrueSkill rate with ranks to handle draws correctly
+        new_rating_groups = trueskill.rate(rating_groups, ranks=ranks)
+        
+        # Update new ratings for each player
+        for team_idx, reward in enumerate(sorted_rewards):
+            team_pids = teams[reward]
+            team_new_ratings = new_rating_groups[team_idx]
+            
+            for pid_idx, pid in enumerate(team_pids):
+                new_ratings[pid] = team_new_ratings[pid_idx]
     else:
         raise ValueError(f"Unsupported game type: {game_type}")
     
@@ -126,13 +196,32 @@ def determine_outcomes(rewards: Dict[int, float]) -> Dict[int, str]:
     Determines the outcome (win/loss/draw) for each player based on their rewards.
     """
     max_reward = max(rewards.values())
-    num_max = sum(1 for r in rewards.values() if r == max_reward)
+    min_reward = min(rewards.values())
     outcomes = {}
-    for pid, r in rewards.items():
-        if r == max_reward:
-            outcomes[pid] = "draw" if num_max > 1 else "win"
+
+    if max_reward == min_reward:
+        if max_reward == 0:
+            # All players have zero rewards
+            for pid in rewards:
+                outcomes[pid] = "draw"
+        elif max_reward < 0:
+            # All players have negative rewards
+            for pid in rewards:
+                outcomes[pid] = "loss"
         else:
-            outcomes[pid] = "loss"
+            # All players have positive rewards
+            for pid in rewards:
+                outcomes[pid] = "win"
+    else:
+        # Mixed rewards
+        for pid, reward in rewards.items():
+            if reward == max_reward:
+                outcomes[pid] = "win"
+            elif reward == min_reward:
+                outcomes[pid] = "loss"
+            else:
+                outcomes[pid] = "draw"
+
     return outcomes
 
 async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, supabase: Client):
