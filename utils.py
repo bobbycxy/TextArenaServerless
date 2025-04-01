@@ -271,7 +271,17 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
     for pid in game_obj.player_dict:
         token = game_obj.player_dict[pid]["token"]
         model_id = trueskill_update_dict[token]["model_id"]
-        human_id = token if model_id == 0 else None
+        model_name = supabase.table("models").select("model_name").eq("id", model_id).execute()
+        game_obj.player_dict[pid]["model_name"] = model_name.data[0]["model_name"]
+        # human_id = token if model_id == 0 else None
+        if model_id == 0:
+            human_check = supabase.table("humans").select("id").eq("cookie_id", token).execute()
+            if len(human_check.data) > 0:
+                human_id = human_check.data[0]["id"]
+            else:
+                raise ValueError(f"No human found for token: {token}")
+        else:
+            human_id = None
         reward = rewards[pid]
         outcome = outcomes[pid]
         trueskill_change = trueskill_update_dict[token]["new_trueskill"] - trueskill_update_dict[token]["old_trueskill"]
@@ -312,8 +322,8 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
         if websocket:
             try:
                 token = game_obj.player_dict[pid]["token"]
-                opponents = [{"player_id": other_pid, "outcome": outcomes[other_pid]} for other_pid in game_obj.player_dict if other_pid != pid]
-                
+                opponents = ", ".join([game_obj.player_dict[other_pid]['model_name'] for other_pid in game_obj.player_dict if other_pid != pid])
+                opponents_ts = ", ".join([str(round(trueskill_update_dict[game_obj.player_dict[other_pid]['token']]["new_trueskill"],3)) for other_pid in game_obj.player_dict if other_pid != pid])
                 # Get trueskill change and new value
                 ts_change = trueskill_update_dict[token]["new_trueskill"] - trueskill_update_dict[token]["old_trueskill"]
                 new_ts = trueskill_update_dict[token]["new_trueskill"]
@@ -322,10 +332,12 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
                     "command": "game_over",
                     "outcome": outcomes[pid],
                     "reward": rewards[pid],
-                    "trueskill_change": ts_change,
-                    "new_trueskill": new_ts,
+                    "trueskill_change": round(ts_change, 3),
+                    "new_trueskill": round(new_ts, 3),
+                    "reason": reason,
+                    "game_id": game_id,
                     "opponents": opponents,
-                    "reason": reason
+                    "opponents_ts": opponents_ts,
                 }
                 
                 # Log the game over message with trueskill details

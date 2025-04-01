@@ -176,8 +176,6 @@ class Game:
             # Game is over, but don't close connections yet
             logging.info(f"Game is over. Reason: {self.info.get('reason', 'unknown')}")
             
-            # Send game over message asynchronously and track it
-            asyncio.create_task(self._send_game_over_message())
             
             # Now update the game state and send final messages
             asyncio.create_task(update_game_state(
@@ -186,36 +184,10 @@ class Game:
                 reason=self.info.get('reason'),
                 supabase=self.supabase
             ))
-            
+
             # Schedule shutdown AFTER messages are confirmed as sent
             asyncio.create_task(self._wait_and_shutdown(10))  # 10 second deadline as a safety measure
-    
-    async def _send_game_over_message(self):
-        """Send a game over message to all players and tracks its delivery"""
-        for pid in self.player_dict:
-            websocket = self.player_dict[pid]["websocket"]
-            if websocket:
-                try:
-                    message = {
-                        "command": "game_over",
-                        "outcome": "completed",
-                        "reason": self.info.get('reason', 'Game completed'),
-                        "game_id": str(random.randint(10000, 99999)),  # Placeholder for game ID
-                        "trueskill_change": 0  # Placeholder for skill change
-                    }
-                    await websocket.send_text(json.dumps(message))
-                    self.game_over_messages_sent[pid] = True
-                    logging.info(f"Game over message sent to Player {pid}")
-                except Exception as e:
-                    logging.error(f"Error sending game over message to Player {pid}: {e}")
-            else:
-                # Mark as sent if websocket doesn't exist
-                self.game_over_messages_sent[pid] = True
-        
-        # Check if all messages have been sent
-        self.all_messages_sent = all(self.game_over_messages_sent.values())
-        logging.info(f"All game over messages sent: {self.all_messages_sent}")
-    
+
     async def _wait_and_shutdown(self, max_delay=10):
         """Wait for all messages to be sent before shutting down with a safety timeout."""
         start_time = time.time()
