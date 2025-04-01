@@ -114,42 +114,48 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
                 new_ratings[pid] = new_rating_groups[group_index][0]
                 group_index += 1
     elif game_type == "multi_player_team":
-        # For team-based games, we need to group players by their rewards
-        # Players with the same reward are on the same team
         teams = {}
+        unique_rewards = set(rewards.values())
         for pid, reward in rewards.items():
             if reward not in teams:
                 teams[reward] = []
             teams[reward].append(pid)
         
-        # Sort teams by reward (highest first)
+        # Check if the teams are unbalanced, else make it balanced
+        if len(unique_rewards) > 1:
+            reward_1 = unique_rewards.pop()
+            reward_2 = unique_rewards.pop()
+            if len(teams[reward_1]) > len(teams[reward_2]):
+                for _ in range(len(teams[reward_1]) - len(teams[reward_2])):
+                    teams[reward_2].append(teams[reward_2][0])
+            elif len(teams[reward_2]) > len(teams[reward_1]):
+                for _ in range(len(teams[reward_2]) - len(teams[reward_1])):
+                    teams[reward_1].append(teams[reward_1][0])
+            else:
+                pass
+                
         sorted_rewards = sorted(teams.keys(), reverse=True)
         
-        # Create rating groups for trueskill
         rating_groups = []
         ranks = []
         for reward in sorted_rewards:
             team_ratings = [player_ratings[pid]["rating"] for pid in teams[reward]]
             rating_groups.append(team_ratings)
-            
-            # For ranks, use negative of reward so higher rewards get lower ranks
-            # TrueSkill expects lower ranks to be better
             ranks.append(-reward)
         
-        # If all teams have the same reward (all draw), ensure ranks are all the same
         if len(set(ranks)) == 1:
             ranks = [0] * len(ranks)
         
-        # Use TrueSkill rate with ranks to handle draws correctly
         new_rating_groups = trueskill.rate(rating_groups, ranks=ranks)
         
-        # Update new ratings for each player
+        # Calculate average team ratings after update
         for team_idx, reward in enumerate(sorted_rewards):
             team_pids = teams[reward]
             team_new_ratings = new_rating_groups[team_idx]
             
             for pid_idx, pid in enumerate(team_pids):
                 new_ratings[pid] = team_new_ratings[pid_idx]
+
     else:
         raise ValueError(f"Unsupported game type: {game_type}")
     
