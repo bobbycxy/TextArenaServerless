@@ -8,6 +8,7 @@ from typing import List, Dict
 import textarena as ta
 import os
 import threading
+from fastapi import Path, Depends
 
 import logging
 import traceback
@@ -50,7 +51,10 @@ def get_allowed_origins():
         "http://127.0.0.1:8000",
         "https://www.textarena.ai",
         "https://textarena.ai",
-        "https://api.textarena.ai"
+        "https://api.textarena.ai",
+        "https://matchmaking.textarena.ai",
+        "https://gamehost.textarena.ai",
+        ""
     ]
 
 def force_exit_after_delay(delay=15):
@@ -69,7 +73,8 @@ def force_exit_after_delay(delay=15):
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=get_allowed_origins(),
+    # allow_origins=get_allowed_origins(),
+    allow_origins=["*"],  # Allow all origins for testing
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -77,14 +82,14 @@ app.add_middleware(
     max_age=3600
 )
 
-@app.middleware("http")
-async def cors_middleware(request: Request, call_next):
-    origin = request.headers.get("origin", "")
-    response = await call_next(request)
-    if origin in get_allowed_origins():
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+# @app.middleware("http")
+# async def cors_middleware(request: Request, call_next):
+#     origin = request.headers.get("origin", "")
+#     response = await call_next(request)
+#     if origin in get_allowed_origins():
+#         response.headers["Access-Control-Allow-Origin"] = origin
+#         response.headers["Access-Control-Allow-Credentials"] = "true"
+#     return response
 
 # Add this middleware to check for shutdown requests
 @app.middleware("http")
@@ -398,7 +403,7 @@ class Game:
         self.all_messages_sent = all(self.game_over_messages_sent.values())
         
         # Now update game state
-        await update_game_state(self, rewards, "Timed out", self.supabase)
+        # await update_game_state(self, rewards, "Timed out", self.supabase)
         
         # Wait and initiate shutdown only after confirming messages are sent
         asyncio.create_task(self._wait_and_shutdown(10))
@@ -425,6 +430,152 @@ async def initialize_server(request: InitializeRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "message": "Server is running."}
+
+# Add this function to extract game_id from path parameters
+@app.get("/game/{game_id}/health")
+async def game_health_check(game_id: str = Path(...)):
+    """Health check endpoint accessible through the ALB routing pattern"""
+    return {"status": "ok", "message": "Server is running.", "game_id": game_id}
+
+
+@app.websocket("/game/{game_id}/ws")
+async def game_websocket_endpoint(websocket: WebSocket, game_id: str):
+    logging.info(f"New WebSocket connection request for game {game_id}")
+    await websocket.accept()
+    logging.info(f"WebSocket connection accepted for game {game_id}")
+    
+    token = websocket.query_params.get("token")
+    logging.info(f"Connection with token: {token} for game {game_id}")
+    
+    # Set up some variables to track state
+    connection_active = True
+    player_pid = None
+
+    if game_obj is None:
+        logging.error(f"Game not initialized for game {game_id}")
+        await websocket.send_text(json.dumps({"command": "error", "message": "Game not initialized"}))
+        await websocket.close(code=1000)
+        return
+
+    if token is None or not game_obj.is_valid_token(token):
+        logging.error(f"Invalid token: {token}")
+        await websocket.send_text(json.dumps({"command": "error", "message": "Invalid token"}))
+        await websocket.close(code=1000)
+        return
+
+    # Get player ID for logging
+    if token in game_obj.token_to_pid:
+        player_pid = game_obj.token_to_pid[token]
+        logging.info(f"Player {player_pid} connected with token {token}")
+
+    # Add the websocket to the game
+    try:
+        logging.info(f"Adding websocket for Player {player_pid} to game")
+        game_obj.add_websocket(token=token, websocket=websocket)
+        logging.info(f"Websocket added for Player {player_pid}")
+    except Exception as e:
+        logging.error(f"Error adding websocket for Player {player_pid}: {e}")
+        logging.error(traceback.format_exc())
+        await websocket.close(code=1011)  # Internal error
+        return
+
+    try:
+        # Keep the connection alive
+        while connection_active and not (game_obj.done and game_obj.game_over_messages_sent.get(player_pid, False)):
+            try:
+                logging.debug(f"Waiting for message from Player {player_pid}")
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)  # 30-second timeout
+                logging.info(f"Received data from Player {player_pid}: {data[:100]}...")
+                
+                try:
+                    payload = json.loads(data)
+                    command = payload.get("command")
+                    logging.info(f"Player {player_pid} sent command: {command}")
+
+                    if command == "leave":
+                        logging.info(f"Player {player_pid} requested to leave")
+                        await game_obj.set_timeout(token)
+                        connection_active = False
+                    elif command == "action":
+                        logging.info(f"Player {player_pid} sent action: {payload.get('action', '')[:50]}...")
+                        
+                        # First send acknowledgment before processing the action
+                        try:
+                            ack_msg = json.dumps({
+                                "command": "action_ack",
+                                "message": "Action received"
+                            })
+                            logging.debug(f"Sending action acknowledgment to Player {player_pid}")
+                            await websocket.send_text(ack_msg)
+                            logging.info(f"Action acknowledgment sent to Player {player_pid}")
+                        except Exception as e:
+                            logging.error(f"Error sending acknowledgment to Player {player_pid}: {e}")
+                            logging.error(traceback.format_exc())
+                            raise
+                        
+                        # Then process the action
+                        logging.debug(f"Processing action from Player {player_pid}")
+                        await command_action(payload, token, websocket)
+                        logging.info(f"Action processed for Player {player_pid}")
+                        
+                    elif command == "ping":
+                        # Respond to ping with pong
+                        logging.debug(f"Received ping from Player {player_pid}")
+                        await websocket.send_text(json.dumps({"command": "pong"}))
+                        logging.debug(f"Sent pong to Player {player_pid}")
+                    else:
+                        logging.warning(f"Unknown command from Player {player_pid}: {command}")
+                        await websocket.send_text(json.dumps({"command": "error", "message": f"Unknown command: {command}"}))
+                except json.JSONDecodeError as e:
+                    logging.error(f"Invalid JSON from Player {player_pid}: {e}")
+                    logging.error(f"Raw data: {data}")
+                    await websocket.send_text(json.dumps({"command": "error", "message": "Invalid JSON payload"}))
+                except Exception as e:
+                    logging.error(f"Error processing command from Player {player_pid}: {e}")
+                    logging.error(traceback.format_exc())
+                    await websocket.send_text(json.dumps({"command": "error", "message": f"Command processing error: {str(e)}"}))
+                    
+            except asyncio.TimeoutError:
+                # Send a ping to keep the connection alive
+                logging.debug(f"No message received from Player {player_pid} in 30s, sending ping")
+                try:
+                    await websocket.send_text(json.dumps({"command": "ping"}))
+                    logging.debug(f"Ping sent to Player {player_pid}")
+                except Exception as e:
+                    logging.error(f"Error sending ping to Player {player_pid}: {e}")
+                    logging.error(traceback.format_exc())
+                    connection_active = False
+            
+            # Check if the game is done and this player has received their game over message
+            if game_obj.done and game_obj.game_over_messages_sent.get(player_pid, False):
+                logging.info(f"Game is done and Player {player_pid} has received game over message. Breaking loop.")
+                break
+                
+    except WebSocketDisconnect as e:
+        logging.warning(f"WebSocket disconnected for Player {player_pid}, code: {e.code}")
+        # Don't set timeout immediately if game is already done and we're just waiting for messages
+        if not game_obj.done:
+            await game_obj.set_timeout(token)
+    except Exception as e:
+        logging.error(f"Unexpected error for Player {player_pid}: {e}")
+        logging.error(traceback.format_exc())
+        try:
+            await websocket.send_text(json.dumps({"command": "error", "message": f"Server error: {str(e)}"}))
+        except:
+            logging.error("Could not send error message to client")
+    
+    # Final cleanup
+    logging.info(f"WebSocket handler ending for Player {player_pid}")
+    
+    # Only set timeout if the game isn't already done
+    if not game_obj.done:
+        try:
+            logging.info(f"Setting timeout for Player {player_pid}")
+            await game_obj.set_timeout(token)
+            logging.info(f"Timeout set for Player {player_pid}")
+        except Exception as e:
+            logging.error(f"Error during timeout handling: {e}")
+            logging.error(traceback.format_exc())
 
 
 @app.websocket("/ws")
@@ -565,6 +716,7 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             logging.error(f"Error during timeout handling: {e}")
             logging.error(traceback.format_exc())
+
 
 async def command_action(payload: Dict, token: str, websocket: WebSocket):
     global game_obj
