@@ -69,7 +69,7 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
         if rewards[p1_id] > rewards[p2_id]:
             new_p1_rating, new_p2_rating = trueskill.rate_1vs1(p1_rating, p2_rating)
         elif rewards[p1_id] < rewards[p2_id]:
-            new_p1_rating, new_p2_rating = trueskill.rate_1vs1(p2_rating, p1_rating)
+            new_p2_rating, new_p1_rating = trueskill.rate_1vs1(p2_rating, p1_rating)
         else:
             new_p1_rating, new_p2_rating = trueskill.rate_1vs1(p1_rating, p2_rating, drawn=True)
         new_ratings[p1_id] = new_p1_rating
