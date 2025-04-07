@@ -523,6 +523,10 @@ async def game_websocket_endpoint(websocket: WebSocket, game_id: str):
                         logging.debug(f"Received ping from Player {player_pid}")
                         await websocket.send_text(json.dumps({"command": "pong"}))
                         logging.debug(f"Sent pong to Player {player_pid}")
+                    elif command == "pong":
+                        # This is a response to our ping, just acknowledge it
+                        logging.debug(f"Received pong from Player {player_pid}")
+                        # No response needed
                     else:
                         logging.warning(f"Unknown command from Player {player_pid}: {command}")
                         await websocket.send_text(json.dumps({"command": "error", "message": f"Unknown command: {command}"}))
@@ -773,4 +777,4 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal_handler)
     
     # Start server with graceful shutdown
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, ws_ping_interval=30, ws_ping_timeout=90)
