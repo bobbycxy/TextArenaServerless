@@ -9,6 +9,7 @@ import textarena as ta
 import os
 import threading
 from fastapi import Path, Depends
+from utils import get_participant_label_from_token
 
 import logging
 import traceback
@@ -386,10 +387,14 @@ class Game:
             websocket = self.player_dict[pid]["websocket"]
             if websocket:
                 try:
+                    timed_out_token = self.player_dict[timeout_pid]["token"]
+                    participant_label = get_participant_label_from_token(timed_out_token, self.supabase)
+
                     message = {
                         "command": "timed_out",
-                        "message": f"Player {self.current_player_id} timed out. Game complete."
+                        "message": f"{participant_label} (Player {timeout_pid}) timed out. Game complete."
                     }
+
                     await websocket.send_text(json.dumps(message))
                     self.game_over_messages_sent[pid] = True
                     logging.info(f"Timeout message sent to Player {pid}")

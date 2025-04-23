@@ -5,6 +5,31 @@ import datetime
 import json
 import logging
 
+def get_participant_label_from_token(token: str, supabase: Client) -> str:
+    """
+    Returns a display label for the player given their token:
+    - "Model <model_name>" if from models table
+    - "Human <human_id>" if from humans table
+    """
+    try:
+        # Check if it's a human first
+        human_response = supabase.table("humans").select("id").eq("cookie_id", token).limit(1).execute()
+        if human_response.data and len(human_response.data) > 0:
+            human_id = human_response.data[0]["id"]
+            return f"Human {human_id}"
+
+        # Otherwise, check the models table
+        model_response = supabase.table("models").select("model_name").eq("model_token", token).limit(1).execute()
+        if model_response.data and len(model_response.data) > 0:
+            model_name = model_response.data[0]["model_name"]
+            return f"Model {model_name}"
+
+        # Unknown type
+        return "Unknown Participant"
+    except Exception as e:
+        logging.error(f"Error fetching participant name for token {token}: {e}")
+        return "Unknown Participant"
+
 def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], player_dict: Dict[int, Dict], supabase: Client) -> Dict:
     """
     Calculate and update TrueSkill ratings for players based on game results.
@@ -310,7 +335,8 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
                 "observation": move["observation"],
                 "timestamp_observation": datetime.datetime.fromtimestamp(move["timestamp_observation"]).isoformat(),
                 "action": move["action"],
-                "timestamp_action": datetime.datetime.fromtimestamp(move["timestamp_action"]).isoformat() if move["timestamp_action"] else None
+                "timestamp_action": datetime.datetime.fromtimestamp(move["timestamp_action"]).isoformat() if move["timestamp_action"] else None,
+                "board_string": game_obj.env.get_board_str() if hasattr(game_obj.env, "get_board_str") else None
             }
             supabase.table("moves").insert(move_data).execute()
 
