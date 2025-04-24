@@ -349,6 +349,7 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
             try:
                 token = game_obj.player_dict[pid]["token"]
                 opponents = ", ".join([game_obj.player_dict[other_pid]['model_name'] for other_pid in game_obj.player_dict if other_pid != pid])
+                opponents_with_ids = ", ".join([f"{other_pid}:{game_obj.player_dict[other_pid]['model_name']}" for other_pid in game_obj.player_dict if other_pid != pid])
                 opponents_ts = ", ".join([str(round(trueskill_update_dict[game_obj.player_dict[other_pid]['token']]["new_trueskill"],3)) for other_pid in game_obj.player_dict if other_pid != pid])
                 # Get trueskill change and new value
                 ts_change = trueskill_update_dict[token]["new_trueskill"] - trueskill_update_dict[token]["old_trueskill"]
@@ -362,8 +363,9 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
                     "new_trueskill": round(new_ts, 3),
                     "reason": reason,
                     "game_id": game_id,
-                    "opponents": opponents,
+                    "opponents": opponents,  # Keep the original format for backward compatibility
                     "opponents_ts": opponents_ts,
+                    "opponents_with_ids": opponents_with_ids,  # New field that includes player IDs
                 }
                 
                 # Log the game over message with trueskill details
@@ -371,6 +373,7 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
                 logging.info(f"  - Outcome: {outcomes[pid]}")
                 logging.info(f"  - Reward: {rewards[pid]}")
                 logging.info(f"  - New TrueSkill: {new_ts:.2f} (Δ: {ts_change:+.2f})")
+                logging.info(f"  - Opponents with IDs: {opponents_with_ids}")
                 await websocket.send_text(json.dumps(message))
                 game_obj.game_over_messages_sent[pid] = True
                 logging.info(f"Game over message sent to Player {pid} from update_game_state")
