@@ -44,18 +44,34 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
         is_human = len(human_check.data) > 0
         
         if is_human:
-            human_tokens.add(token)
+            human_id = human_check.data[0]["id"]
             model_id = 0
+            ts_response = supabase.table("trueskill_humans_models")\
+                .select("trueskill", "sd", "updated_at")\
+                .eq("model_id", model_id)\
+                .eq("human_id", human_id)\
+                .eq("environment_id", environment_id)\
+                .order("updated_at", desc=True)\
+                .limit(1)\
+                .execute()
         else:
             model_response = supabase.table("models").select("id").eq("model_token", token).execute()
             if not model_response.data:
                 raise ValueError(f"No model found for token: {token}")
             model_id = model_response.data[0]["id"]
-        
-        ts_response = supabase.table("trueskill").select("trueskill", "sd", "updated_at").eq("model_id", model_id).eq("environment_id", environment_id).order("updated_at", desc=True).limit(1).execute()
+            human_id = None
+            ts_response = supabase.table("trueskill_humans_models")\
+                .select("trueskill", "sd", "updated_at")\
+                .eq("model_id", model_id)\
+                .is_("human_id", "null")\
+                .eq("environment_id", environment_id)\
+                .order("updated_at", desc=True)\
+                .limit(1)\
+                .execute()
+
         
         # Enhanced logging for trueskill data
-        logging.info(f"TrueSkill response for player_id={player_id}, model_id={model_id}, environment_id={environment_id}:")
+        logging.info(f"TrueSkill response for player_id={player_id}, model_id={model_id}, human_id={human_id}, environment_id={environment_id}:")
         logging.info(f"Full ts_response data: {json.dumps(ts_response.data, indent=2) if ts_response.data else 'No data'}")
         
         if ts_response.data:
@@ -73,10 +89,12 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
         player_ratings[player_id] = {
             "token": token,
             "model_id": model_id,
+            "human_id": human_id if is_human else None,
             "rating": trueskill.Rating(mu=current_ts, sigma=current_sd)
         }
         result[token] = {
             "model_id": model_id,
+            "human_id": human_id if is_human else None,
             "old_trueskill": current_ts,
             "old_sd": current_sd
         }
@@ -190,6 +208,7 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
     for player_id, new_rating in new_ratings.items():
         token = player_ratings[player_id]["token"]
         model_id = player_ratings[player_id]["model_id"]
+        human_id = player_ratings[player_id]["human_id"]
         old_ts = result[token]["old_trueskill"]
         old_sd = result[token]["old_sd"]
         
@@ -205,20 +224,30 @@ def update_trueskill_scores(environment_id: int, rewards: Dict[int, float], play
         })
         
         # Log before updating Supabase with clear change indicators
-        logging.info(f"Player {player_id} (token={token}, model_id={model_id}):")
+        logging.info(f"Player {player_id} (token={token}, model_id={model_id}, human_id={human_id}):")
         logging.info(f"  - Trueskill: {old_ts:.2f} → {new_rating.mu:.2f} (Δ: {ts_change:+.2f})")
         logging.info(f"  - SD: {old_sd:.2f} → {new_rating.sigma:.2f} (Δ: {sd_change:+.2f})")
         
         # Perform the update
-        upsert_response = supabase.table("trueskill").upsert({
-            "model_id": model_id,
-            "environment_id": environment_id,
-            "trueskill": new_rating.mu,
-            "sd": new_rating.sigma
-        }).execute()
+        if human_id is not None:
+            upsert_response = supabase.table("trueskill_humans_models").upsert({
+                "model_id": 0,
+                "human_id": human_id,
+                "environment_id": environment_id,
+                "trueskill": new_rating.mu,
+                "sd": new_rating.sigma
+            }).execute()
+        else:
+            upsert_response = supabase.table("trueskill_humans_models").upsert({
+                "model_id": model_id,
+                "human_id": None,
+                "environment_id": environment_id,
+                "trueskill": new_rating.mu,
+                "sd": new_rating.sigma
+            }).execute()
         
         # Log the response from the upsert operation
-        logging.info(f"Supabase upsert response for player {player_id}: {upsert_response.data if hasattr(upsert_response, 'data') else 'No data'}")
+        logging.info(f"Supabase upsert response for player {player_id} (model_id={model_id}, human_id={human_id}): {upsert_response.data if hasattr(upsert_response, 'data') else 'No data'}")
     
     return result
 
@@ -296,17 +325,10 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
     for pid in game_obj.player_dict:
         token = game_obj.player_dict[pid]["token"]
         model_id = trueskill_update_dict[token]["model_id"]
+        human_id = trueskill_update_dict[token]["human_id"]
         model_name = supabase.table("models").select("model_name").eq("id", model_id).execute()
         game_obj.player_dict[pid]["model_name"] = model_name.data[0]["model_name"]
-        # human_id = token if model_id == 0 else None
-        if model_id == 0:
-            human_check = supabase.table("humans").select("id").eq("cookie_id", token).execute()
-            if len(human_check.data) > 0:
-                human_id = human_check.data[0]["id"]
-            else:
-                raise ValueError(f"No human found for token: {token}")
-        else:
-            human_id = None
+        
         reward = rewards[pid]
         outcome = outcomes[pid]
         trueskill_change = trueskill_update_dict[token]["new_trueskill"] - trueskill_update_dict[token]["old_trueskill"]
@@ -348,6 +370,8 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
         if websocket:
             try:
                 token = game_obj.player_dict[pid]["token"]
+                model_id = trueskill_update_dict[token]["model_id"]
+                human_id = trueskill_update_dict[token]["human_id"]
                 opponents = ", ".join([game_obj.player_dict[other_pid]['model_name'] for other_pid in game_obj.player_dict if other_pid != pid])
                 opponents_with_ids = ", ".join([f"{other_pid}:{game_obj.player_dict[other_pid]['model_name']}" for other_pid in game_obj.player_dict if other_pid != pid])
                 opponents_ts = ", ".join([str(round(trueskill_update_dict[game_obj.player_dict[other_pid]['token']]["new_trueskill"],3)) for other_pid in game_obj.player_dict if other_pid != pid])
@@ -369,14 +393,14 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
                 }
                 
                 # Log the game over message with trueskill details
-                logging.info(f"Game over for Player {pid}:")
+                logging.info(f"Game over for Player {pid} (model_id={model_id}, human_id={human_id}):")
                 logging.info(f"  - Outcome: {outcomes[pid]}")
                 logging.info(f"  - Reward: {rewards[pid]}")
                 logging.info(f"  - New TrueSkill: {new_ts:.2f} (Δ: {ts_change:+.2f})")
                 logging.info(f"  - Opponents with IDs: {opponents_with_ids}")
                 await websocket.send_text(json.dumps(message))
                 game_obj.game_over_messages_sent[pid] = True
-                logging.info(f"Game over message sent to Player {pid} from update_game_state")
+                logging.info(f"Game over message sent to Player {pid} (model_id={model_id}, human_id={human_id}) from update_game_state")
             except Exception as e:
                 message_send_exceptions.append((pid, str(e)))
                 logging.error(f"Error sending game over message to Player {pid} from update_game_state: {e}")
