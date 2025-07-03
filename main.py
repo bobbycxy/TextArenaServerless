@@ -131,13 +131,16 @@ class Game:
 
         self.connected = {pid: True for pid in self.player_dict}
         self.done = False
-        self.info = {}
+        self.step_info = {}
+        self.game_info = {}
         self.current_player_id = None
         self.moves = {token: [] for token in tokens}
         self.move_deadline = None  # Deadline current player's move
 
         self.env = ta.make(env_id=env_id)
-        self.env = ta.wrappers.ActionFormattingWrapper(env=self.env)
+        ## check if environment is already wrapped
+        if not isinstance(self.env, ta.wrappers.ActionFormattingWrapper):
+            self.env = ta.wrappers.ActionFormattingWrapper(env=self.env)
         self.env.reset(num_players=len(self.tokens))
 
         # Start background timeout checker
@@ -163,8 +166,8 @@ class Game:
         if not self.done:
             # Process the action
             try:
-                self.done, self.info = self.env.step(action=action)
-                logging.info(f"Environment step completed. Done: {self.done}, Info: {self.info}")
+                self.done, self.step_info = self.env.step(action=action)
+                logging.info(f"Environment step completed. Done: {self.done}, Info: {self.step_info}")
                 
                 self.moves[token][-1]["action"] = action
                 self.moves[token][-1]["timestamp_action"] = time.time()
@@ -172,7 +175,7 @@ class Game:
             except Exception as e:
                 logging.error(f"Error during environment step: {e}")
                 self.done = True
-                self.info = {"error": f"Environment step error: {str(e)}"}
+                self.step_info = {"error": f"Environment step error: {str(e)}"}
 
         if not self.done:
             # Get and send observation for the next player's turn
@@ -180,14 +183,14 @@ class Game:
             asyncio.create_task(self._get_and_send_observation())
         else:
             # Game is over, but don't close connections yet
-            logging.info(f"Game is over. Reason: {self.info.get('reason', 'unknown')}")
-            
+            rewards, game_info = self.env.close()
+            logging.info(f"Game is over. Reason: {game_info[0].get("reason", "unknown")}")
             
             # Now update the game state and send final messages
             asyncio.create_task(update_game_state(
                 game_obj=self,
-                rewards=self.env.close(),
-                reason=self.info.get('reason'),
+                rewards=rewards,
+                reason=game_info[0].get("reason", "unknown"),
                 supabase=self.supabase
             ))
 
@@ -282,13 +285,18 @@ class Game:
     async def _get_and_send_observation(self):
         logging.info("Getting next observation")
         try:
-            next_player_id, observation = self.env.get_observation()
-            logging.info(f"Observation received for Player {next_player_id}, length: {len(observation) if observation else 0}")
+            # Get the player ID and raw observation tuples from the environment state
+            next_player_id = self.env.state.current_player_id
+            raw_observation_tuples = self.env.state.get_current_player_observation()
+            
+            logging.info(f"Raw observation received for Player {next_player_id}, length: {len(raw_observation_tuples) if raw_observation_tuples else 0}")
             
             self.current_player_id = next_player_id
             token = self.player_dict[next_player_id]["token"]
+            
+            # Store the raw observation tuples for moves tracking
             self.moves[token].append({
-                "observation": observation,
+                "observation": raw_observation_tuples,  # Store the raw tuples
                 "timestamp_observation": time.time(),
                 "action": None,
                 "timestamp_action": None,
@@ -299,8 +307,24 @@ class Game:
             self.move_deadline = time.time() + 180
             next_player_ws = self.player_dict[next_player_id]["websocket"]
             
-            message = {"command": "observation", "observation": observation, "player_id": self.current_player_id}
-            logging.debug(f"Sending observation to Player {next_player_id}")
+            # Convert the observation tuples to JSON-serializable format
+            # Each tuple is (sender_id, message, ObservationType)
+            serializable_observation = []
+            if raw_observation_tuples:
+                for sender_id, message, obs_type in raw_observation_tuples:
+                    serializable_observation.append([
+                        sender_id, 
+                        message, 
+                        obs_type.value  # Convert ObservationType enum to int for JSON
+                    ])
+            
+            message = {
+                "command": "observation", 
+                "observation": serializable_observation,  # Send as list of [sender_id, message, obs_type_int]
+                "player_id": self.current_player_id
+            }
+            
+            logging.debug(f"Sending observation to Player {next_player_id}: {len(serializable_observation)} observation tuples")
             
             try:
                 await next_player_ws.send_text(json.dumps(message))

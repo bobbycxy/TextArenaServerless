@@ -351,10 +351,24 @@ async def update_game_state(game_obj, rewards: Dict[int, float], reason: str, su
         token = game_obj.player_dict[pid]["token"]
         player_game_id = player_game_ids[pid]
         for move in game_obj.moves[token]:
+            # Extract just the message text from observation tuples
+            observation_text = ""
+            if move["observation"]:
+                messages = []
+                for obs_tuple in move["observation"]:
+                    if len(obs_tuple) >= 2:
+                        # obs_tuple is (sender_id, message, ...) - extract the message
+                        sender_id, message = obs_tuple[0], obs_tuple[1]
+                        messages.append(f"[{sender_id}] {message}")
+                    else:
+                        # Unexpected format, just convert to string
+                        messages.append(str(obs_tuple))
+                observation_text = "\n".join(messages)
+            
             move_data = {
                 "game_id": game_id,
                 "player_game_id": player_game_id,
-                "observation": move["observation"],
+                "observation": observation_text,  # Store as formatted text string
                 "timestamp_observation": datetime.datetime.fromtimestamp(move["timestamp_observation"]).isoformat(),
                 "action": move["action"],
                 "timestamp_action": datetime.datetime.fromtimestamp(move["timestamp_action"]).isoformat() if move["timestamp_action"] else None,
